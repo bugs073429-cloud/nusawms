@@ -1,0 +1,104 @@
+
+name: Extract ZIP to Repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path file ZIP di repository"
+        required: true
+        default: "website.zip"
+        type: string
+      output_dir:
+        description: "Folder tujuan hasil ekstraksi"
+        required: true
+        default: "extracted"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Extract ZIP safely
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import zipfile
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          zip_path = (root / os.environ["ZIP_PATH"]).resolve()
+          out_rel = os.environ["OUTPUT_DIR"]
+
+          if not re.fullmatch(r"[A-Za-z0-9_./-]+", out_rel):
+              raise SystemExit("Nama folder tujuan tidak valid.")
+
+          out = (root / out_rel).resolve()
+
+          if out == root or root not in out.parents:
+              raise SystemExit("Folder tujuan harus di dalam repository.")
+
+          if not zip_path.is_relative_to(root):
+              raise SystemExit("ZIP harus berada di dalam repository.")
+
+          if not zip_path.is_file() or zip_path.suffix.lower() != ".zip":
+              raise SystemExit("File ZIP tidak ditemukan atau ekstensi salah.")
+
+          if out == zip_path or out in zip_path.parents:
+              raise SystemExit("Folder tujuan tidak boleh menimpa ZIP.")
+
+          out.mkdir(parents=True, exist_ok=True)
+
+          with zipfile.ZipFile(zip_path) as archive:
+              for item in archive.infolist():
+                  target = (out / item.filename).resolve()
+
+                  if target != out and out not in target.parents:
+                      raise SystemExit(
+                          f"Path berbahaya di dalam ZIP: {item.filename}"
+                      )
+
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(
+                          parents=True, exist_ok=True
+                      )
+                      with archive.open(item) as src:
+                          with target.open("wb") as dst:
+                              while True:
+                                  chunk = src.read(1024 * 1024)
+                                  if not chunk:
+                                      break
+                                  dst.write(chunk)
+
+          print(f"Ekstraksi selesai: {out_rel}")
+          PY
+
+      - name: Commit extracted files
+        env:
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- "$OUTPUT_DIR"
+
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan untuk di-commit."
+          else
+            git commit -m "Extract ZIP archive"
+            git push
+          fi
