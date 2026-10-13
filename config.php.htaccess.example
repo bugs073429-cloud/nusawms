@@ -1,0 +1,2 @@
+# Catatan: letakkan file ini sebagai aturan server bila deployment tidak mendukung .htaccess.
+# Jangan letakkan kredensial produksi di bawah document root.
