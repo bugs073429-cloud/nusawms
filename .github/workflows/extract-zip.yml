@@ -1,104 +1,124 @@
-
-name: Extract ZIP to Repository
+name: Extract and Validate Nusa WMS
 
 on:
   workflow_dispatch:
-    inputs:
-      zip_path:
-        description: "Path file ZIP di repository"
-        required: true
-        default: "website.zip"
-        type: string
-      output_dir:
-        description: "Folder tujuan hasil ekstraksi"
-        required: true
-        default: "extracted"
-        type: string
 
 permissions:
   contents: write
 
 jobs:
-  extract:
+  extract-and-validate:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Extract ZIP safely
+      - name: Extract ZIP safely into repository root
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
-          OUTPUT_DIR: ${{ inputs.output_dir }}
+          ZIP_PATH: Nusa_WMS_GitHub_Ready_Root.zip
         run: |
           python - <<'PY'
           import os
-          import re
+          import stat
           import zipfile
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
 
           root = Path.cwd().resolve()
           zip_path = (root / os.environ["ZIP_PATH"]).resolve()
-          out_rel = os.environ["OUTPUT_DIR"]
-
-          if not re.fullmatch(r"[A-Za-z0-9_./-]+", out_rel):
-              raise SystemExit("Nama folder tujuan tidak valid.")
-
-          out = (root / out_rel).resolve()
-
-          if out == root or root not in out.parents:
-              raise SystemExit("Folder tujuan harus di dalam repository.")
-
-          if not zip_path.is_relative_to(root):
-              raise SystemExit("ZIP harus berada di dalam repository.")
+          protected = {
+              os.environ["ZIP_PATH"],
+              ".github/workflows/extract-zip.yml",
+          }
 
           if not zip_path.is_file() or zip_path.suffix.lower() != ".zip":
-              raise SystemExit("File ZIP tidak ditemukan atau ekstensi salah.")
-
-          if out == zip_path or out in zip_path.parents:
-              raise SystemExit("Folder tujuan tidak boleh menimpa ZIP.")
-
-          out.mkdir(parents=True, exist_ok=True)
+              raise SystemExit(f"File ZIP tidak ditemukan: {zip_path.name}")
+          if not zipfile.is_zipfile(zip_path):
+              raise SystemExit("File sumber bukan arsip ZIP yang valid.")
 
           with zipfile.ZipFile(zip_path) as archive:
-              for item in archive.infolist():
-                  target = (out / item.filename).resolve()
+              members = archive.infolist()
+              if len(members) > 10000:
+                  raise SystemExit("Arsip berisi terlalu banyak file.")
+              total_size = sum(member.file_size for member in members)
+              if total_size > 100 * 1024 * 1024:
+                  raise SystemExit("Ukuran hasil ekstraksi melebihi batas 100 MB.")
 
-                  if target != out and out not in target.parents:
-                      raise SystemExit(
-                          f"Path berbahaya di dalam ZIP: {item.filename}"
-                      )
+              # Validate every path before writing any file.
+              planned = []
+              for member in members:
+                  name = member.filename
+                  posix = PurePosixPath(name)
+                  if posix.is_absolute() or ".." in posix.parts:
+                      raise SystemExit(f"Path tidak aman di dalam ZIP: {name}")
+                  if not name or name in (".",):
+                      continue
+                  if "\\" in name:
+                      raise SystemExit(f"Path dengan separator tidak valid: {name}")
+                  target = (root / Path(*posix.parts)).resolve()
+                  if target != root and root not in target.parents:
+                      raise SystemExit(f"Path keluar dari repository: {name}")
+                  if name.rstrip("/") in protected:
+                      continue
+                  mode = (member.external_attr >> 16) & 0o170000
+                  if mode == stat.S_IFLNK:
+                      raise SystemExit(f"Symlink tidak diizinkan di dalam ZIP: {name}")
+                  planned.append((member, target))
 
-                  if item.is_dir():
+              for member, target in planned:
+                  if member.is_dir():
                       target.mkdir(parents=True, exist_ok=True)
-                  else:
-                      target.parent.mkdir(
-                          parents=True, exist_ok=True
-                      )
-                      with archive.open(item) as src:
-                          with target.open("wb") as dst:
-                              while True:
-                                  chunk = src.read(1024 * 1024)
-                                  if not chunk:
-                                      break
-                                  dst.write(chunk)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(member) as source, target.open("wb") as destination:
+                      while True:
+                          chunk = source.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          destination.write(chunk)
 
-          print(f"Ekstraksi selesai: {out_rel}")
+          required = [
+              "README.md",
+              "public/index.php",
+              "src/app.php",
+              "database/schema.sql",
+              "tests/php/test_project_structure.php",
+              ".github/workflows/php-ci.yml",
+          ]
+          missing = [path for path in required if not (root / path).is_file()]
+          if missing:
+              raise SystemExit("File proyek wajib tidak ditemukan: " + ", ".join(missing))
+          print(f"Ekstraksi selesai. File ZIP tetap dipertahankan: {zip_path.name}")
           PY
 
-      - name: Commit extracted files
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo, pdo_mysql, mbstring
+          coverage: none
+
+      - name: Check PHP syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            php -l "$file"
+          done < <(find . -type f -name '*.php' -not -path './.git/*' -print0)
+
+      - name: Run project structure regression checks
+        run: php tests/php/test_project_structure.php
+
+      - name: Commit extracted project files
         env:
-          OUTPUT_DIR: ${{ inputs.output_dir }}
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -- "$OUTPUT_DIR"
-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- .
           if git diff --cached --quiet; then
-            echo "Tidak ada perubahan untuk di-commit."
+            echo "Tidak ada perubahan file untuk di-commit."
           else
-            git commit -m "Extract ZIP archive"
-            git push
+            git commit -m "Extract and validate Nusa WMS project"
+            git push origin "HEAD:${BRANCH_NAME}"
           fi
